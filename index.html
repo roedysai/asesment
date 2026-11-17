@@ -976,6 +976,21 @@
 
     function createSupabaseDriver() {
       let client = null;
+      // Pesan error yang mudah dipahami (tabel belum dibuat / RLS menolak / sesi habis)
+      function sbError(col, error) {
+        const msg = String((error && error.message) || error || "");
+        const code = String((error && error.code) || "");
+        if (code === "42P01" || code === "PGRST205" || /does not exist|schema cache/i.test(msg)) {
+          return new Error(`Tabel "${col}" belum dibuat di Supabase. Jalankan file supabase_schema.sql di SQL Editor.`);
+        }
+        if (code === "42501" || /row-level security|permission denied/i.test(msg)) {
+          return new Error(`Akses ke tabel "${col}" ditolak (RLS). Pastikan sudah masuk dan kebijakan RLS dari supabase_schema.sql sudah dijalankan.`);
+        }
+        if (code === "PGRST301" || /JWT/i.test(msg)) {
+          return new Error("Sesi masuk sudah habis. Silakan masuk ulang.");
+        }
+        return new Error(`${col}: ${msg}`);
+      }
       return {
         name: "supabase",
         async init() {
@@ -983,14 +998,16 @@
           if (/ANDA/.test(SUPABASE_URL) || /ANDA/.test(SUPABASE_ANON_KEY)) {
             throw new Error("Isi SUPABASE_URL dan SUPABASE_ANON_KEY terlebih dahulu.");
           }
-          const mod = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/+esm");
-          client = mod.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+          const mod = await import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm");
+          client = mod.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+            auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false }
+          });
         },
         async list(col) {
           const out = [];
           for (let from = 0; ; from += 1000) {
             const { data, error } = await client.from(col).select("id,data").order("id").range(from, from + 999);
-            if (error) throw new Error(`${col}: ${error.message}`);
+            if (error) throw sbError(col, error);
             out.push(...data.map(fromRow));
             if (data.length < 1000) break;
           }
@@ -998,24 +1015,36 @@
         },
         async upsert(col, id, obj) {
           const { error } = await client.from(col).upsert(toRow(col, id, obj), { onConflict: "id" });
-          if (error) throw new Error(`${col}: ${error.message}`);
+          if (error) throw sbError(col, error);
         },
         async bulkUpsert(col, items) {
           for (let i = 0; i < items.length; i += 200) {
             const rows = items.slice(i, i + 200).map((d) => toRow(col, d.id, d));
             const { error } = await client.from(col).upsert(rows, { onConflict: "id" });
-            if (error) throw new Error(`${col}: ${error.message}`);
+            if (error) throw sbError(col, error);
           }
         },
         async remove(col, id) {
           const { error } = await client.from(col).delete().eq("id", id);
-          if (error) throw new Error(`${col}: ${error.message}`);
+          if (error) throw sbError(col, error);
         },
         auth: {
           async signIn(email, password) {
             const { data, error } = await client.auth.signInWithPassword({ email, password });
             if (error) throw new Error(/invalid/i.test(error.message) ? "Email atau kata sandi salah." : error.message);
             return { email: data.user.email };
+          },
+          // Pulihkan sesi Supabase yang tersimpan (agar tidak login ulang saat halaman dibuka lagi)
+          async restore() {
+            const { data, error } = await client.auth.getSession();
+            if (error || !data || !data.session || !data.session.user) return null;
+            return { email: data.session.user.email };
+          },
+          // Dipanggil bila sesi berakhir / keluar dari tab lain
+          onSignedOut(cb) {
+            client.auth.onAuthStateChange((event) => {
+              if (event === "SIGNED_OUT") cb();
+            });
           },
           async signOut() {
             await client.auth.signOut();
@@ -1338,7 +1367,12 @@
       { id: "asp_3", nama: "Kerjasama & Kolaborasi Tim", nilai: 92 }
     ];
 
-    const PREVIEW_STATE = {
+    // ===== DATA DUMMY KHUSUS PREVIEW =====
+    // Saat IS_PREVIEW = false, blok ini otomatis kosong (tidak dipakai & tidak dikirim ke database).
+    // Boleh dihapus seluruhnya (sampai tanda "AKHIR DATA DUMMY") jika ingin source lebih ringkas.
+    const PREVIEW_STATE = !IS_PREVIEW ? {
+      profil_guru: [], pengaturan_mapel: [], murid: [], nilai_asesmen: [], reward_siswa: [], kelompok_belajar: []
+    } : {
       profil_guru: [
         {
           id: "main_profile",
@@ -1518,8 +1552,10 @@
         }
       ]
     };
+    // ===== AKHIR DATA DUMMY =====
 
     const STATE = {
+      booting: !IS_PREVIEW,
       user: null,
       activeMenu: "beranda",
       selectedMapelId: IS_PREVIEW ? "sem1_X1_informatika" : "",
@@ -2568,9 +2604,11 @@
         if (syncState.pending.size && force !== true) {
           return showToast(`Masih ada ${syncState.pending.size} data belum tersimpan ke database. Tunggu sinkronisasi selesai sebelum keluar.`);
         }
+        STATE.loggingOut = true;
         try {
           await DB.auth.signOut();
         } catch (e) {}
+        STATE.loggingOut = false;
       }
       STATE.user = null;
       renderApp();
@@ -6246,6 +6284,11 @@
       const prof = getTeacherProfile();
       applyGuiTheme(prof.temaGui || "default");
 
+      if (!STATE.user && STATE.booting) {
+        root.innerHTML = `<div class="login-screen"><div style="text-align:center;color:var(--text-secondary);font-weight:600">Memuat sesi & data dari database...</div></div>`;
+        return;
+      }
+
       if (!STATE.user) {
         root.innerHTML = renderLoginScreen();
         return;
@@ -6420,7 +6463,43 @@
       `;
     }
 
+    // Pulihkan sesi Supabase yang masih berlaku saat halaman dibuka (tanpa login ulang)
+    async function bootSession() {
+      if (IS_PREVIEW) return;
+      try {
+        await DB.init();
+        if (typeof DB.auth.onSignedOut === "function") {
+          DB.auth.onSignedOut(() => {
+            if (STATE.user && !STATE.loggingOut) {
+              STATE.user = null;
+              showToast("Sesi berakhir. Silakan masuk lagi.");
+              renderApp();
+            }
+          });
+        }
+        const cred = typeof DB.auth.restore === "function" ? await DB.auth.restore() : null;
+        if (cred) {
+          restorePending();
+          await flushPending();
+          await loadAllData();
+          applyPendingToState();
+          STATE.user = {
+            identitas: cred.email,
+            nama: getTeacherProfile().namaGuru || cred.email,
+            role: "Admin",
+            aksesKelas: "Semua"
+          };
+        }
+      } catch (err) {
+        showToast("Gagal memuat data: " + (err.message || err));
+      } finally {
+        STATE.booting = false;
+        renderApp();
+      }
+    }
+
     renderApp();
+    bootSession();
   </script>
 </body>
 </html>
